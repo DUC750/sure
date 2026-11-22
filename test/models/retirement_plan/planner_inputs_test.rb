@@ -107,13 +107,19 @@ class RetirementPlan::PlannerInputsTest < ActiveSupport::TestCase
 
   # 50,000 left is behind the contract's 49,400 or so: the contracted
   # repayment no longer clears it by maturity, so there is no payoff year.
-  test "a loan its contracted repayment no longer clears seeds nothing" do
+  # The contract still asks for the repayment until maturity.
+  test "a loan its contracted repayment no longer clears seeds its repayment until maturity" do
     loan_account = own_loan(balance: 50_000, term_months: 60)
     assert_nil Loan::PayoffProjection.new(loan_account.loan, as_of: AS_OF).payoff_date, "precondition: no payoff date"
+    schedule = loan_account.loan.amortization_schedule
 
     @plan.seed_streams!(as_of: AS_OF)
+    stream = @plan.streams.find_by!(source: "seeded_loan")
 
-    assert_not @plan.streams.exists?(source: "seeded_loan")
+    assert_equal schedule.payment_in_force(AS_OF).amount * 12, stream.annual_amount
+    assert_equal (AS_OF - 12.months + 60.months).year, schedule.payoff_date.year, "precondition: maturity"
+    assert_equal schedule.payoff_date.year, stream.end_year
+    assert_equal AS_OF, @plan.reload.streams_seeded_on
   end
 
   test "a loan with nothing left to pay seeds nothing" do
@@ -306,6 +312,29 @@ class RetirementPlan::PlannerInputsTest < ActiveSupport::TestCase
     assert_equal BigDecimal("100000"), sim.rows.first.start_value
     assert_equal BigDecimal("12000"), sim.rows.first.contribution, "20% of 60,000 a year of income"
     assert_equal BigDecimal("30000"), sim.rows.find { |r| r.year == 2040 }.withdrawal
+  end
+
+  # A stream keeps the currency it was entered in. After the family changes
+  # its currency, the simulation converts the amount rather than reading
+  # 30,000 dollars as 30,000 euros.
+  test "a stream's amount is converted into the family's current currency" do
+    @plan.update!(inflation_rate: 0, end_age: 70, retirement_date: Date.new(2040, 1, 1))
+    stream = @plan.streams.create!(kind: "expense", name: "Living costs", annual_amount: 30_000)
+    assert_equal "USD", stream.currency
+
+    @member.family.update_columns(currency: "EUR")
+    ExchangeRate.create!(from_currency: "USD", to_currency: "EUR", date: AS_OF, rate: 0.5)
+
+    assert_equal BigDecimal("15000"), @plan.reload.simulation(as_of: AS_OF).rows.find { |r| r.year == 2040 }.withdrawal
+  end
+
+  test "a stream with no rate into the family's currency is left out of the simulation" do
+    @plan.update!(inflation_rate: 0, end_age: 70, retirement_date: Date.new(2040, 1, 1))
+    @plan.streams.create!(kind: "expense", name: "Living costs", annual_amount: 30_000)
+    @plan.streams.create!(kind: "expense", name: "Rent", annual_amount: 1_000, currency: "EUR")
+    ExchangeRate.stubs(:provider).returns(nil)
+
+    assert_equal BigDecimal("30000"), @plan.simulation(as_of: AS_OF).rows.find { |r| r.year == 2040 }.withdrawal
   end
 
   test "without a birth year there is no simulation and no solution" do
