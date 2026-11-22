@@ -2293,6 +2293,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_20_100000) do
     t.uuid "account_id"
     t.decimal "annual_amount", precision: 19, scale: 4, null: false
     t.datetime "created_at", null: false
+    t.string "currency", null: false
     t.integer "end_year"
     t.boolean "indexed", default: true, null: false
     t.string "kind", null: false
