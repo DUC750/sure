@@ -79,12 +79,17 @@ class RetirementPlan < ApplicationRecord
   # `as_of` dates the balances and the planning years. The spending and income
   # medians are always today's: IncomeStatement takes them over the history up
   # to now, so call this with today's date rather than a past one.
+  #
+  # The assets come first: converting them can fetch and store a missing rate,
+  # and the medians read stored rates only.
   def projection(as_of:)
+    current_assets = assets_as_of(as_of).total
+
     RetirementPlan::Projection.new(
       as_of: as_of,
       annual_expenses: income_statement.median_expense(interval: "month", excluding_kinds: SAVING_KINDS).to_d * 12,
       annual_income: income_statement.median_income(interval: "month").to_d * 12,
-      current_assets: assets_as_of(as_of).total,
+      current_assets: current_assets,
       safe_withdrawal_rate: safe_withdrawal_rate,
       expected_annual_return: expected_annual_return,
       savings_rate: savings_rate,
@@ -233,10 +238,20 @@ class RetirementPlan < ApplicationRecord
         annual_contribution: projection(as_of: as_of).annual_contribution,
         expected_annual_return: expected_annual_return,
         inflation_rate: inflation_rate,
-        streams: streams.map(&:to_simulation_stream),
+        streams: simulation_streams(as_of),
         birth_year: birth_year,
         end_age: end_age
       }
+    end
+
+    # Each stream in the family's currency. A stream with no rate into it is
+    # left out, as an account with none is left out of the asset total.
+    def simulation_streams(as_of)
+      streams.filter_map do |stream|
+        stream.to_simulation_stream(currency: user.family.currency, date: as_of)
+      rescue Money::ConversionError
+        nil
+      end
     end
 
     # Linked accounts when any the user picked can still fund the plan,
@@ -272,25 +287,29 @@ class RetirementPlan < ApplicationRecord
     end
 
     # Each loan's repayment, at the payment in force on the reference date,
-    # until the year its projection pays it off. A loan whose projection does
-    # not apply (nothing left to pay, or a payment that never clears it) seeds
-    # nothing rather than an invented figure. Returns how many loans were
-    # skipped for want of an exchange rate.
+    # until the year its projection pays it off. A loan its repayment no
+    # longer clears has no payoff date, but the contract still asks for that
+    # repayment until maturity, so its stream ends there. A loan whose
+    # projection does not apply (nothing left to pay, or no payments left)
+    # seeds nothing rather than an invented figure. Returns how many loans
+    # were skipped for want of an exchange rate.
     def seed_loans(as_of)
       seeded = streams.where(source: "seeded_loan").pluck(:account_id).compact
       skipped = 0
 
       finance_accounts.where(accountable_type: "Loan").where.not(id: seeded).includes(:accountable).find_each do |account|
         projection = Loan::PayoffProjection.new(account.accountable, as_of: as_of)
-        next unless projection.applicable? && projection.payoff_date
+        next unless projection.applicable?
 
-        payment = account.accountable.amortization_schedule&.payment_in_force(as_of)
+        schedule = account.accountable.amortization_schedule
+        payment = schedule&.payment_in_force(as_of)
         next if payment.nil?
 
+        end_date = projection.payoff_date || schedule.payoff_date
         # Twelve: AmortizationSchedule#payment_schedule is monthly.
         annual = payment.exchange_to(user.family.currency, date: as_of).amount * 12
         streams.create!(kind: "expense", source: "seeded_loan", indexed: false, account: account,
-                        name: account.name, annual_amount: annual, end_year: projection.payoff_date.year)
+                        name: account.name, annual_amount: annual, end_year: end_date.year)
       rescue Money::ConversionError
         skipped += 1
       end
